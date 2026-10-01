@@ -37,14 +37,14 @@ Filenames are `<title>, YYYY-MMM-DD.txt` — readable in Finder and Drive.
 
 ## How it works
 
-Three scripts run in sequence, kicked off by a macOS LaunchAgent every hour:
+The export scripts run in sequence, kicked off by a macOS LaunchAgent every hour:
 
-1. **`fetch_granola.py`** reads the WorkOS access token Granola's desktop app stores at `~/Library/Application Support/Granola/supabase.json`, then calls Granola's internal API to pull every meeting's metadata, AI summary panels, and full transcript. Saves to `~/Library/Application Support/Granola/granola_export/`.
+1. **`fetch_granola.py`** uses a separate Granola sign-in managed by **`granola_auth.py`**, then calls Granola's internal API to pull every meeting's metadata, AI summary panels, and full transcript. The sync renews its own credentials automatically. Saves to `~/Library/Application Support/Granola/granola_export/`.
 2. **`build_docs.py`** turns the raw JSON into one plain-text dossier per meeting.
 3. **`tag_meetings.py`** (optional) injects a `Tags:` line into each dossier using simple keyword rules — `customer-discovery`, `investor-pitch`, etc. Edit the rules to match your own buckets.
 4. **`rclone copy`** uploads only new/changed dossiers to a folder in your Drive.
 
-The official Granola MCP gates transcripts behind a paid plan. The desktop app already has them cached locally with a valid auth token — we just reuse it. Read-only, never writes back to Granola.
+Meeting access is read-only. The sync creates and renews its own authentication session; it never modifies meeting data or the desktop app's credentials. Current Granola versions encrypt desktop storage with an app-protected Keychain key, so the old `supabase.json` approach no longer works.
 
 ## Setup (3 minutes)
 
@@ -64,10 +64,31 @@ The installer will:
 1. `brew install rclone`
 2. Run `rclone config` to authenticate with your Google account (one-time browser OAuth)
 3. Copy the scripts into `~/Library/Application Support/Granola/claude_sync/`
-4. Install the LaunchAgent at `~/Library/LaunchAgents/com.cowork.granola-fetch.plist`
-5. Kick off a manual test run to backfill all your meetings
+4. Connect a separate Granola session through your browser (one time)
+5. Install the LaunchAgent at `~/Library/LaunchAgents/com.cowork.granola-fetch.plist`
+6. Kick off a manual test run to backfill all your meetings
 
 By default the LaunchAgent fires every hour from 7am–9pm. Edit the plist if you want a different schedule.
+
+### Repairing an older installation
+
+Run `./install.sh` again from this updated checkout. When prompted:
+
+1. Open the printed Granola sign-in URL and sign in to your existing account.
+2. Cancel the browser's prompt to open Granola. Copy the browser address from the “Opening Granola” page.
+3. Paste that address at the terminal's hidden prompt.
+
+The sync stores its separate credentials at `~/Library/Application Support/granola-to-drive/auth.json` with owner-only permissions. It renews them automatically without requiring the desktop app to be open. Never commit or share this file. The Google login requests basic sign-in information, without requesting additional calendar permissions.
+
+To reconnect later:
+
+```bash
+cd ~/Library/Application\ Support/Granola/claude_sync
+python3 granola_auth.py login
+python3 granola_auth.py complete
+```
+
+The `login` command prints a URL; `complete` prompts for the resulting browser address. Use `login --provider microsoft` for Microsoft accounts. Existing unencrypted desktop credentials remain a read-only fallback for older Granola installations; expired desktop refresh tokens are never reused.
 
 ### Configuration
 
@@ -79,6 +100,9 @@ export GRANOLA_DRIVE_FOLDER="Knowledge Based"
 
 # rclone remote name (created during `rclone config`). Default: "gdrive"
 export GRANOLA_RCLONE_REMOTE="gdrive"
+
+# Optional: use a different local export directory for all export stages
+# export GRANOLA_EXPORT_DIR="$HOME/Documents/granola_export"
 ```
 
 ## Using the synced data
@@ -112,21 +136,32 @@ python3 ~/Library/Application\ Support/Granola/claude_sync/tag_meetings.py
 
 ## Troubleshooting
 
-**"Token expired" in the log**
-The WorkOS access token lasts ~6 hours and refreshes whenever you open the Granola desktop app. If you go a full day without opening it, that hour's run no-ops cleanly — just open the app once and the next run picks up.
+**"Credentials not found", "Token expired", or encrypted desktop credentials in the log**
+Update the installation and connect the separate sync login as described above. Opening Granola no longer updates the old plaintext credentials. If the sync session is revoked, run `granola_auth.py login` and `granola_auth.py complete` again. Network and authentication failures stop the run with an error; they do not report a successful upload.
 
 **Nothing showing up in Drive**
 Check `~/Library/Logs/granola-fetch.log` for errors. The script logs every step.
 
 **Granola changes their API**
-This uses an undocumented internal API. If Granola changes endpoints or request shape, fix `fetch_granola.py`. Reverse-engineering references in [`docs/api-notes.md`](docs/api-notes.md).
+This uses an undocumented internal API. If Granola changes endpoints or request shape, fix `fetch_granola.py`. The client version is read from the installed Granola app. Check the references below if the API changes again.
 
 ## Caveats
 
 - **Unofficial** — uses Granola's internal API. Could break with any Granola update.
-- **Read-only on Granola** — never writes back, but exfiltrating your own data is a gray area. Personal use only.
-- **Your local `supabase.json` token can read all your Granola data.** Treat the file like a password.
+- **Read-only meeting access** — creates and renews an authentication session, but never edits meetings. Personal use only.
+- **Your local sync `auth.json` can read your Granola data.** Treat the file like a password. Rotated refresh tokens are saved atomically under a file lock.
 - **Single-user** — designed for one Mac, one Drive account. Multi-user not supported.
+
+## Verification
+
+```bash
+python3 -m unittest discover -s tests -v
+bash -n install.sh refresh.sh
+```
+
+Fetches preserve the previous document index on failures, retry changed meetings, and retry old empty transcript/summary responses after 24 hours. Uploads use `rclone copy`, so files already in Drive are not deleted.
+
+Run verification from the repository root. The nested `granola-to-drive/` directory is a compatibility copy of the scripts; keep it in sync with the repository root when changing them.
 
 ## License
 

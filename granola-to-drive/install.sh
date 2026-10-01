@@ -2,7 +2,13 @@
 # install.sh — set up granola-to-drive on macOS.
 # Idempotent: re-running won't break anything.
 
-set -uo pipefail
+set -euo pipefail
+
+if [ -f "$HOME/.granola-to-drive.env" ]; then
+  set -a
+  source "$HOME/.granola-to-drive.env"
+  set +a
+fi
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$HOME/Library/Application Support/Granola/claude_sync"
@@ -28,11 +34,6 @@ step "Checking prerequisites"
 if [ ! -d "$HOME/Library/Application Support/Granola" ]; then
   fatal "Granola desktop app not detected at ~/Library/Application Support/Granola.
         Install it from https://granola.ai and sign in first."
-fi
-
-if [ ! -f "$HOME/Library/Application Support/Granola/supabase.json" ]; then
-  fatal "Granola found but you're not signed in (supabase.json missing).
-        Open the Granola app and sign in, then re-run install.sh."
 fi
 
 command -v python3 >/dev/null 2>&1 || fatal "python3 not found. Install Python 3.10+."
@@ -64,10 +65,20 @@ fi
 
 step "Copying scripts to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
-for f in fetch_granola.py build_docs.py tag_meetings.py refresh.sh; do
+BACKUP_DIR="$INSTALL_DIR/backups/$(date +%Y%m%d-%H%M%S)"
+for f in granola_auth.py fetch_granola.py build_docs.py tag_meetings.py refresh.sh; do
+  if [ -f "$INSTALL_DIR/$f" ] && ! cmp -s "$REPO_DIR/$f" "$INSTALL_DIR/$f"; then
+    mkdir -p "$BACKUP_DIR"
+    cp -p "$INSTALL_DIR/$f" "$BACKUP_DIR/$f"
+  fi
   cp -v "$REPO_DIR/$f" "$INSTALL_DIR/$f"
 done
 chmod +x "$INSTALL_DIR/refresh.sh"
+
+if ! python3 "$INSTALL_DIR/granola_auth.py" status; then
+  python3 "$INSTALL_DIR/granola_auth.py" login
+  python3 "$INSTALL_DIR/granola_auth.py" complete
+fi
 
 # --- 5. Install LaunchAgent --------------------------------------------------
 

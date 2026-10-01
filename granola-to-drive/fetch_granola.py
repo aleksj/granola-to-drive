@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
 fetch_granola.py — pull every Granola meeting (full transcript + AI panels)
-using the local desktop-app token in ~/Library/Application Support/Granola/supabase.json.
-
-Why this exists: Granola's official MCP gates transcripts behind a paid plan,
-but the desktop app fetches them via an internal Bearer-auth API using a
-WorkOS access_token already on disk. We just reuse that.
+using an independent, automatically renewed login from granola_auth.py.
 
 Usage:
     python3 fetch_granola.py
@@ -15,11 +11,10 @@ Output (written to ~/Library/Application Support/Granola/granola_export/):
     transcripts/<id>.json   — list of transcript segments (text, timestamps, speaker)
     summary.txt             — quick console summary
 
-Safe to re-run. Skips transcripts already on disk.
+Safe to re-run. Refreshes changed meetings and retries empty cached responses.
 """
 
 import gzip
-import io
 import json
 import os
 import sys
@@ -28,39 +23,19 @@ import urllib.request
 import urllib.error
 import zlib
 from pathlib import Path
+from granola_auth import AuthError, atomic_json, client_version, load_token
 
-SUPABASE = Path.home() / "Library/Application Support/Granola/supabase.json"
-OUT = Path.home() / "Library/Application Support/Granola/granola_export"
+OUT = Path(os.environ.get("GRANOLA_EXPORT_DIR", str(Path.home() / "Library/Application Support/Granola/granola_export")))
 TRANSCRIPTS_DIR = OUT / "transcripts"
 PANELS_DIR = OUT / "panels"
 
 API_BASE = "https://api.granola.ai"
-UA = "Granola/6.4.0 (reverse-engineered local export)"
+UA = f"Granola/{client_version()} (local export)"
 
 
 def die(msg, code=1):
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(code)
-
-
-def load_token():
-    if not SUPABASE.exists():
-        die(f"Granola credentials not found at {SUPABASE} — is the desktop app installed and signed in?")
-    with open(SUPABASE) as f:
-        sup = json.load(f)
-    workos = json.loads(sup["workos_tokens"])
-    obtained_at = workos["obtained_at"]
-    expires_in_ms = workos["expires_in"] * 1000
-    expiry = obtained_at + expires_in_ms
-    now = int(time.time() * 1000)
-    remaining = (expiry - now) / 1000
-    if remaining < 60:
-        die(
-            f"WorkOS access token expires in {remaining:.0f}s. "
-            "Open the Granola desktop app to trigger a refresh, then re-run."
-        )
-    print(f"Token OK ({remaining/60:.0f} min remaining).")
-    return workos["access_token"]
 
 
 def _decode_body(raw, content_encoding):
@@ -96,7 +71,7 @@ def post(path, token, body, timeout=30):
             "Accept": "*/*",
             "Accept-Encoding": "gzip",
             "User-Agent": UA,
-            "X-Client-Version": "6.4.0",
+            "X-Client-Version": client_version(),
         },
     )
     try:
@@ -124,24 +99,34 @@ def fetch_documents(token):
     """
     PAGE = 1000  # Granola happily returns more than 100 if you ask
     all_docs = []
+    seen = set()
     offset = 0
     for _ in range(50):  # hard cap (50 pages = 50k meetings)
         body = {"limit": PAGE, "offset": offset}
         status, resp = post("/v2/get-documents", token, body)
-        if status != 200:
-            print(f"  /v2/get-documents failed ({status}): {resp}", file=sys.stderr)
+        if status in (404, 405):
             status, resp = post("/v1/get-documents", token, body)
-            if status != 200:
-                die(f"both /v1 and /v2 get-documents failed: {resp}")
-        docs = resp.get("docs") or resp.get("documents") or []
+        if status != 200:
+            die(f"get-documents failed (HTTP {status}); keeping the existing export.")
+        if not isinstance(resp, dict):
+            die("Unexpected get-documents response; keeping the existing export.")
+        docs = resp.get("docs", resp.get("documents"))
+        if not isinstance(docs, list) or any(not isinstance(d, dict) or not d.get("id") for d in docs):
+            die("Unexpected get-documents schema; keeping the existing export.")
         if not docs:
             break
+        ids = {d["id"] for d in docs}
+        if ids & seen or len(ids) != len(docs):
+            die("Repeated documents in pagination; refusing an incomplete export.")
+        seen.update(ids)
         all_docs.extend(docs)
         print(f"  fetched {len(all_docs)} so far (page returned {len(docs)})...")
         if len(docs) < PAGE:
             break  # short page = end of data
         offset += len(docs)
         time.sleep(0.2)
+    else:
+        die("Document pagination exceeded 50 pages; keeping the existing export.")
     return all_docs
 
 
@@ -149,6 +134,8 @@ def fetch_transcript(token, doc_id):
     status, resp = post("/v1/get-document-transcript", token, {"document_id": doc_id})
     if status != 200:
         return None, f"HTTP {status}: {str(resp)[:200]}"
+    if not isinstance(resp, list):
+        return None, "Unexpected transcript response (expected a list)"
     return resp, None
 
 
@@ -157,7 +144,22 @@ def fetch_panels(token, doc_id):
     status, resp = post("/v1/get-document-panels", token, {"document_id": doc_id})
     if status != 200:
         return None, f"HTTP {status}: {str(resp)[:200]}"
+    if not isinstance(resp, list):
+        return None, "Unexpected panels response (expected a list)"
     return resp, None
+
+
+def cache_current(path, doc, previous):
+    if not path.exists():
+        return False
+    if doc.get("updated_at") != previous.get("updated_at"):
+        return False
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    # A meeting can still be recording/generating when first fetched.
+    return isinstance(data, list) and (bool(data) or time.time() - path.stat().st_mtime < 86400)
 
 
 def main():
@@ -165,19 +167,27 @@ def main():
     TRANSCRIPTS_DIR.mkdir(exist_ok=True)
     PANELS_DIR.mkdir(exist_ok=True)
 
-    token = load_token()
+    try:
+        token = load_token()
+    except AuthError as exc:
+        die(str(exc))
 
     print("\nFetching documents…")
     docs = fetch_documents(token)
     print(f"Got {len(docs)} documents.\n")
 
-    with open(OUT / "documents.json", "w") as f:
-        json.dump(docs, f, indent=2, default=str)
+    previous_path = OUT / "documents.json"
+    try:
+        previous = {d["id"]: d for d in json.loads(previous_path.read_text())}
+    except (OSError, ValueError, KeyError, TypeError):
+        previous = {}
 
     success, skip, fail = 0, 0, 0
     failures = []
 
     for i, doc in enumerate(docs, 1):
+        if doc.get("deleted_at") or doc.get("was_trashed"):
+            continue
         doc_id = doc.get("id") or doc.get("document_id")
         title = (doc.get("title") or "(untitled)").strip()[:60]
         if not doc_id:
@@ -189,7 +199,7 @@ def main():
         p_path = PANELS_DIR / f"{doc_id}.json"
 
         # Transcript
-        if t_path.exists():
+        if cache_current(t_path, doc, previous.get(doc_id, {})):
             t_status = "cached"
             skip += 1
         else:
@@ -199,23 +209,24 @@ def main():
                 fail += 1
                 failures.append((doc_id, title, err))
             else:
-                with open(t_path, "w") as f:
-                    json.dump(t, f, indent=2, default=str)
+                atomic_json(t_path, t)
                 segs = len(t) if isinstance(t, list) else "?"
                 t_status = f"{segs} segs"
                 success += 1
 
-        # Panels (best-effort)
-        if not p_path.exists():
+        if not cache_current(p_path, doc, previous.get(doc_id, {})):
             p, _err = fetch_panels(token, doc_id)
             if p is not None:
-                with open(p_path, "w") as f:
-                    json.dump(p, f, indent=2, default=str)
+                atomic_json(p_path, p)
+            else:
+                fail += 1
+                failures.append((doc_id, title, f"Summary: {_err}"))
 
         print(f"[{i}/{len(docs)}] {title}: {t_status}")
-        time.sleep(0.3)  # gentle on the API
+        if t_status != "cached":
+            time.sleep(0.3)  # gentle on the API
 
-    print(f"\nDone. transcripts: {success} new, {skip} cached, {fail} failed.")
+    print(f"\nDone. transcripts: {success} fetched, {skip} cached; {fail} fetch errors.")
     print(f"Output: {OUT}")
     if failures:
         print("\nFailures:")
@@ -226,6 +237,10 @@ def main():
         f.write(f"Granola export at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Documents: {len(docs)}\n")
         f.write(f"Transcripts new: {success}, cached: {skip}, failed: {fail}\n")
+
+    if fail:
+        die("Fetch incomplete; keeping the previous document index so failed updates are retried.")
+    atomic_json(previous_path, docs)
 
 
 if __name__ == "__main__":

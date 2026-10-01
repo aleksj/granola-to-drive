@@ -1,14 +1,22 @@
 #!/bin/bash
 # Refresh local Granola export: pull all meetings/transcripts/panels via Granola's
-# internal API (using the WorkOS token in supabase.json), then build per-meeting
-# dossiers ready for the Claude scheduled task to upload to Drive.
+# internal API (using the sync's independently renewed login), then build per-meeting
+# dossiers to upload to Drive.
 #
-# Runs from a macOS LaunchAgent at 6:45 PM daily. Logs to ~/Library/Logs/granola-fetch.log.
+# Runs hourly from a macOS LaunchAgent. Logs to ~/Library/Logs/granola-fetch.log.
 
 set -uo pipefail
 
-DIR="$HOME/Library/Application Support/Granola/claude_sync"
-LOG="$HOME/Library/Logs/granola-fetch.log"
+if [ -f "$HOME/.granola-to-drive.env" ]; then
+  set -a
+  source "$HOME/.granola-to-drive.env" || exit 1
+  set +a
+fi
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG="${GRANOLA_LOG_FILE:-$HOME/Library/Logs/granola-fetch.log}"
+mkdir -p "$(dirname "$LOG")"
+umask 077
 
 # Find a working python3 — prefer Homebrew, fall back to system, then PATH lookup.
 if [ -n "${GRANOLA_PYTHON:-}" ] && command -v "$GRANOLA_PYTHON" >/dev/null 2>&1; then
@@ -64,15 +72,16 @@ if [ "$tag_rc" -ne 0 ]; then
 fi
 
 # Step 3: sync built dossiers to Drive via rclone (uploads only new/changed files)
-BUILT_DIR="$HOME/Library/Application Support/Granola/granola_export/built"
+BUILT_DIR="${GRANOLA_EXPORT_DIR:-$HOME/Library/Application Support/Granola/granola_export}/built"
 RCLONE_BIN="${RCLONE_BIN:-/opt/homebrew/bin/rclone}"
 [ -x "$RCLONE_BIN" ] || RCLONE_BIN="$(command -v rclone)" || RCLONE_BIN=""
 
 if [ -z "$RCLONE_BIN" ]; then
-  echo "WARN: rclone not found on PATH — skipping Drive upload." >> "$LOG"
+  echo "ERROR: rclone not found on PATH — Drive upload cannot run." >> "$LOG"
+  exit 127
 else
   echo "--- rclone copy starting at $(date) ---" >> "$LOG"
-  "$RCLONE_BIN" copy "$BUILT_DIR" "gdrive:${GRANOLA_DRIVE_FOLDER:-Knowledge Based}/" \
+  "$RCLONE_BIN" copy "$BUILT_DIR" "${GRANOLA_RCLONE_REMOTE:-gdrive}:${GRANOLA_DRIVE_FOLDER:-Knowledge Based}/" \
       --include "*.txt" --update --transfers 8 --checkers 8 \
       --log-file "$LOG" --log-level INFO
   rclone_rc=$?
